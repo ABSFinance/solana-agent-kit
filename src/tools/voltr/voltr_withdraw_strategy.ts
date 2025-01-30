@@ -74,6 +74,9 @@ export async function voltrWithdrawStrategy(
       isWritable: account.isWritable,
     })) ?? [];
 
+  const manager = new PublicKey("VOLTR_MANAGER_ADDRESS_HERE");
+
+
   const withdrawIx = await vc.createWithdrawStrategyIx(
     {
       withdrawAmount,
@@ -81,6 +84,7 @@ export async function voltrWithdrawStrategy(
       instructionDiscriminator,
     },
     {
+      manager,
       vault,
       vaultAssetMint,
       strategy,

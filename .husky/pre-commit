@@ -1,1 +1,1 @@
-tsc && lint-staged
+#!/bin/sh\nexport PATH="/usr/local/bin:$PATH"\n. "$(dirname "$0")/_/husky.sh"\n\nnpm test

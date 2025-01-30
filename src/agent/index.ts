@@ -120,6 +120,7 @@ import {
   getPriceInference,
   getAllTopics,
   getInferenceByTopicId,
+  addLiquidityBalToDriftVault,
 } from "../tools";
 import {
   Config,
@@ -896,6 +897,21 @@ export class SolanaAgentKit {
       type,
       price,
     );
+  }
+  async addLiquidityToDelegatedDriftVault(
+    vault: string,
+    symbol: string,
+    bidSpreadBps: [number, number][],
+    askSpreadBps: [number, number][],
+  ) {
+
+    return await addLiquidityBalToDriftVault(
+      this,
+      vault,
+      symbol,       // PERP market symbol
+      bidSpreadBps,    // 0.1% bid spread (10 basis points)
+      askSpreadBps,     // 0.1% ask spread
+    )
   }
   async tradeUsingDriftPerpAccount(
     amount: number,

@@ -74,6 +74,8 @@ export async function voltrDepositStrategy(
       isWritable: account.isWritable,
     })) ?? [];
 
+  const manager = new PublicKey("VOLTR_MANAGER_ADDRESS_HERE");
+
   const depositIx = await vc.createDepositStrategyIx(
     {
       depositAmount,
@@ -81,6 +83,7 @@ export async function voltrDepositStrategy(
       instructionDiscriminator,
     },
     {
+      manager,
       vault,
       vaultAssetMint,
       strategy: strategy,

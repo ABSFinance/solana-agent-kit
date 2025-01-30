@@ -4,6 +4,7 @@ import {
   getLimitOrderParams,
   getMarketOrderParams,
   getOrderParams,
+  JupiterClient,
   MainnetPerpMarkets,
   MainnetSpotMarkets,
   MarketType,
@@ -13,6 +14,7 @@ import {
   PostOnlyParams,
   PRICE_PRECISION,
   QUOTE_PRECISION,
+  SwapReduceOnly,
   TEN,
 } from "@drift-labs/sdk";
 import {
@@ -25,11 +27,44 @@ import {
 import {
   ComputeBudgetProgram,
   PublicKey,
+  VersionedTransaction,
+  AddressLookupTableAccount,
   type TransactionInstruction,
 } from "@solana/web3.js";
 import type { SolanaAgentKit } from "../../agent";
 import { BN } from "bn.js";
 import { initClients } from "./drift";
+
+import {
+  Raydium,
+  makeAddLiquidityInstruction,
+  TokenAmount,
+  ApiV3PoolInfoStandardItem,
+} from "@raydium-io/raydium-sdk-v2";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+
+let lastBid: number | undefined;
+let lastAsk: number | undefined;
+
+const SUFFICIENT_QUOTE_CHANGE_BPS = 2; // only requote if quote price changes by 2 bps
+const BPS_BASE = 10000;
+
+function sufficientQuoteChange(newBid: number, newAsk: number): boolean {
+	if (lastBid === undefined || lastAsk === undefined) {
+		return true;
+	}
+	const bidDiff = newBid / lastBid - 1;
+	const askDiff = newAsk / lastAsk - 1;
+
+	if (
+		Math.abs(bidDiff) > SUFFICIENT_QUOTE_CHANGE_BPS / BPS_BASE ||
+		Math.abs(askDiff) > SUFFICIENT_QUOTE_CHANGE_BPS / BPS_BASE
+	) {
+		return true;
+	}
+
+	return false;
+}
 
 export function getMarketIndexAndType(name: `${string}-${string}`) {
   const [symbol, type] = name.toUpperCase().split("-");
@@ -543,7 +578,7 @@ export async function tradeDriftVault(
     const { driftClient, cleanUp } = await initClients(agent, {
       authority: new PublicKey(vault),
       activeSubAccountId: 0,
-      subAccountIds: [0],
+      subAccountIds: [6],
     });
     const [isOwned, driftLookupTableAccount] = await Promise.all([
       getIsOwned(agent, vault),
@@ -629,14 +664,22 @@ export async function tradeDriftVault(
     }
 
     const latestBlockhash = await driftClient.connection.getLatestBlockhash();
+    const lookupTableAccount = await driftClient.connection.getAddressLookupTable(
+      driftClient.marketLookupTable
+    ).then(res => res.value);
+
+    if (!lookupTableAccount) {
+      throw new Error("Failed to fetch lookup table account");
+    }
+
     const tx = await driftClient.txSender.sendVersionedTransaction(
       await driftClient.txSender.getVersionedTransaction(
         instructions,
-        [driftLookupTableAccount],
+        [lookupTableAccount],
         [],
         driftClient.opts,
         latestBlockhash,
-      ),
+      )
     );
 
     await cleanUp();
@@ -645,5 +688,389 @@ export async function tradeDriftVault(
   } catch (e) {
     // @ts-expect-error - error message is a string
     throw new Error(`Failed to trade with Drift vault: ${e.message}`);
+  }
+}
+
+export async function addLiquidityToDriftVault(
+  agent: SolanaAgentKit,
+  vault: string,
+  poolId: string,
+  amountInA: TokenAmount,
+  amountInB: TokenAmount,
+  otherAmountMin: TokenAmount,
+  fixedSide: "a" | "b",
+  config?: {
+    bypassAssociatedCheck?: boolean;
+    checkCreateATAOwner?: boolean;
+  }
+): Promise<string> {
+  try {
+    const { driftClient, cleanUp } = await initClients(agent, {
+      authority: agent.wallet.publicKey,
+      activeSubAccountId: 0,
+      subAccountIds: [0],
+    });
+
+    const [isOwned, driftLookupTableAccount] = await Promise.all([
+      getIsOwned(agent, vault),
+      driftClient.fetchMarketLookupTableAccount(),
+    ]);
+
+    if (!isOwned) {
+      throw new Error(
+        "This vault is owned/delegated to someone else, you can't trade with it",
+      );
+    }
+
+    const vaultPubkey = new PublicKey(vault);
+    const raydium = await Raydium.load({
+      owner: vaultPubkey,
+      connection: agent.connection,
+      apiRequestTimeout: 30000,
+    });
+
+    // Get pool info
+    const data = await raydium.api.fetchPoolById({ ids: poolId });
+    const poolInfo = data[0] as ApiV3PoolInfoStandardItem;
+
+    if (amountInA.isZero() || amountInB.isZero()) {
+      throw new Error("Amounts must be greater than zero");
+    }
+
+    const { account } = raydium;
+    const { bypassAssociatedCheck = false, checkCreateATAOwner = false } = config || {};
+
+    // Get token accounts
+    const [tokenA, tokenB] = [amountInA.token, amountInB.token];
+    const tokenAccountA = await account.getCreatedTokenAccount({
+      mint: tokenA.mint,
+      associatedOnly: false,
+    });
+    const tokenAccountB = await account.getCreatedTokenAccount({
+      mint: tokenB.mint,
+      associatedOnly: false,
+    });
+
+    if (!tokenAccountA || !tokenAccountB) {
+      throw new Error(`Cannot find target token accounts. Token accounts: ${JSON.stringify(account.tokenAccounts)}`);
+    }
+
+    const lpTokenAccount = await account.getCreatedTokenAccount({
+      mint: new PublicKey(poolInfo.lpMint),
+      associatedOnly: false,
+    });
+
+    // Handle amount a & b and direction
+    const sideA = amountInA.token.mint.toBase58() === poolInfo.mintA.address ? "base" : "quote";
+    let _fixedSide: "base" | "quote" = "base";
+    
+    const tokens = [tokenA, tokenB];
+    const tokenAccounts = [tokenAccountA, tokenAccountB];
+    const rawAmounts = [amountInA.raw, amountInB.raw];
+
+    if (sideA === "quote") {
+      tokens.reverse();
+      tokenAccounts.reverse();
+      rawAmounts.reverse();
+      _fixedSide = fixedSide === "a" ? "quote" : "base";
+    } else {
+      _fixedSide = fixedSide === "a" ? "base" : "quote";
+    }
+
+    const [baseToken, quoteToken] = tokens;
+    const [baseTokenAccount, quoteTokenAccount] = tokenAccounts;
+    const [baseAmountRaw, quoteAmountRaw] = rawAmounts;
+
+    const instructions: TransactionInstruction[] = [];
+    instructions.push(ComputeBudgetProgram.setComputeUnitLimit({ units: 1400000 }));
+
+    // Handle token accounts
+    const { tokenAccount: _baseTokenAccount, ...baseInstruction } = await account.handleTokenAccount({
+      side: "in",
+      amount: baseAmountRaw,
+      mint: baseToken.mint,
+      tokenAccount: baseTokenAccount!,
+      bypassAssociatedCheck,
+      checkCreateATAOwner,
+    });
+    if (baseInstruction.instructions) instructions.push(...baseInstruction.instructions);
+
+    const { tokenAccount: _quoteTokenAccount, ...quoteInstruction } = await account.handleTokenAccount({
+      side: "in",
+      amount: quoteAmountRaw,
+      mint: quoteToken.mint,
+      tokenAccount: quoteTokenAccount!,
+      bypassAssociatedCheck,
+      checkCreateATAOwner,
+    });
+    if (quoteInstruction.instructions) instructions.push(...quoteInstruction.instructions);
+
+    const { tokenAccount: _lpTokenAccount, ...lpInstruction } = await account.handleTokenAccount({
+      side: "out",
+      amount: new BN(0),
+      mint: new PublicKey(poolInfo.lpMint),
+      tokenAccount: lpTokenAccount!,
+      bypassAssociatedCheck,
+    });
+    if (lpInstruction.instructions) instructions.push(...lpInstruction.instructions);
+
+    // Get pool keys and create add liquidity instruction
+    const poolKeys = await raydium.liquidity.getAmmPoolKeys(poolId);
+    const addLiquidityInstruction = makeAddLiquidityInstruction({
+      poolInfo,
+      poolKeys,
+      userKeys: {
+        baseTokenAccount: _baseTokenAccount!,
+        quoteTokenAccount: _quoteTokenAccount!,
+        lpTokenAccount: _lpTokenAccount!,
+        owner: vaultPubkey,
+      },
+      baseAmountIn: baseAmountRaw,
+      quoteAmountIn: quoteAmountRaw,
+      otherAmountMin: otherAmountMin.raw,
+      fixedSide: _fixedSide,
+    });
+
+    instructions.push(addLiquidityInstruction);
+
+    // Send transaction using drift client
+    const latestBlockhash = await driftClient.connection.getLatestBlockhash();
+    const lookupTableAccount = await driftClient.connection.getAddressLookupTable(
+      driftClient.marketLookupTable
+    ).then(res => res.value);
+
+    if (!lookupTableAccount) {
+      throw new Error("Failed to fetch lookup table account");
+    }
+
+    const txid = await driftClient.txSender.sendVersionedTransaction(
+      await driftClient.txSender.getVersionedTransaction(
+        instructions,
+        [lookupTableAccount],
+        [],
+        driftClient.opts,
+        latestBlockhash,
+      )
+    );
+    
+    await cleanUp();
+    return txid.txSig;
+  } catch (e) {
+    // @ts-expect-error - error message is a string
+    throw new Error(`Failed to add liquidity with Drift vault: ${e.message}`);
+  }
+}
+
+export async function swapJupiterToDriftVault(
+  agent: SolanaAgentKit,
+  vault: string,
+  params: {
+    inputMint: PublicKey;
+    outputMint: PublicKey;
+    amount: InstanceType<typeof BN>;
+    slippageBps?: number;
+    swapMode?: "ExactIn" | "ExactOut";
+  }
+): Promise<string> {
+  try {
+    const { driftClient, vaultClient, cleanUp } = await initClients(agent, {
+      authority: new PublicKey(vault),
+      activeSubAccountId: 0,
+      subAccountIds: [0],
+    });
+
+    const vaultPubkey = new PublicKey(vault);
+    const [isOwned, driftLookupTableAccount, vaultAccount] = await Promise.all([
+      getIsOwned(agent, vault),
+      driftClient.fetchMarketLookupTableAccount(),
+      vaultClient.getVault(vaultPubkey),
+    ]);
+
+    if (!isOwned) {
+      throw new Error(
+        "This vault is owned/delegated to someone else, you can't trade with it",
+      );
+    }
+
+    const jupiterClient = new JupiterClient({ connection: agent.connection });
+
+    // Get market indexes from mints
+    const inputMarket = MainnetSpotMarkets.find(m => m.mint.equals(params.inputMint));
+    const outputMarket = MainnetSpotMarkets.find(m => m.mint.equals(params.outputMint));
+    
+    if (!inputMarket || !outputMarket) {
+      throw new Error("Could not find spot markets for input/output tokens");
+    }
+
+    // Get Jupiter swap instructions using drift client's method
+    const { ixs, lookupTables } = await driftClient.getJupiterSwapIxV6({
+      jupiterClient,
+      inMarketIndex: inputMarket.marketIndex,
+      outMarketIndex: outputMarket.marketIndex,
+      amount: params.amount,
+      slippageBps: params.slippageBps || 50,
+      swapMode: params.swapMode || "ExactIn",
+      userAccountPublicKey: vaultAccount.manager,
+    });
+
+    // Build final transaction with compute budget
+    const instructions = [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
+      ...ixs,
+    ];
+
+    // Send transaction using drift client
+    const latestBlockhash = await driftClient.connection.getLatestBlockhash();
+    const lookupTableAccount = await driftClient.connection.getAddressLookupTable(
+      driftClient.marketLookupTable
+    ).then(res => res.value);
+
+    if (!lookupTableAccount) {
+      throw new Error("Failed to fetch lookup table account");
+    }
+
+    const tx = await driftClient.txSender.sendVersionedTransaction(
+      await driftClient.txSender.getVersionedTransaction(
+        instructions,
+        [...lookupTables, lookupTableAccount],
+        [],
+        driftClient.opts,
+        latestBlockhash,
+      )
+    );
+
+    await cleanUp();
+    return tx.txSig;
+
+  } catch (e) {
+    // @ts-expect-error - error message is a string
+    throw new Error(`Failed to swap via Jupiter to Drift vault: ${e.message}`);
+  }
+}
+
+export async function addLiquidityBalToDriftVault(
+  agent: SolanaAgentKit,
+  vault: string,
+  marketSymbol: string,
+  bidSpreadBps: [number, number][],
+  askSpreadBps: [number, number][],
+): Promise<string> {
+  try {
+    const { driftClient, vaultClient, cleanUp }= await initClients(agent, {
+      authority: new PublicKey(vault),
+      activeSubAccountId: 0,
+      subAccountIds: [0],
+    });
+
+    const [isOwned, driftLookupTableAccount] = await Promise.all([
+      getIsOwned(agent, vault),
+      driftClient.connection.getAddressLookupTable(
+        // new PublicKey("FaMS3U4uBojvGn5FSDEPimddcXsCfwkKsFgMVVnDdxGb")
+        driftClient.marketLookupTable
+      ).then(res => res.value)
+    ]);
+
+    if (!isOwned) {
+      throw new Error("Vault must be owned to add balanced liquidity");
+    }
+
+    // Market validation
+    const marketInfo = getMarketIndexAndType(`${marketSymbol}-PERP`);
+    const perpMarket = driftClient.getPerpMarketAccount(marketInfo.marketIndex);
+    
+    if (!perpMarket) {
+      throw new Error(
+        `Perp market not found for ${marketSymbol}-PERP. ` +
+        `Valid markets: ${MainnetPerpMarkets.map(m => m.symbol).join(', ')}`
+      );
+    }
+
+    // Oracle validation
+    const oracleData = driftClient.getOracleDataForPerpMarket(marketInfo.marketIndex);
+    if (!oracleData?.price) {
+      throw new Error(`Oracle price not available for ${marketSymbol}-PERP`);
+    }
+
+    // Price calculations
+    const oraclePrice = convertToNumber(oracleData.price, PRICE_PRECISION);
+
+
+    // Size calculations
+    const vaultValue = await getVaultAvailableBalance(agent, vault);
+
+    const orders = [];
+    let totalAmount = 0;
+    for (const [amount, bidSpreadBp] of bidSpreadBps) {
+      totalAmount += amount;
+
+      const bidPrice = oraclePrice * (1 - bidSpreadBp / 10000);
+      const baseAmountPerSide = (amount / oraclePrice) / 2; // Split amount evenly between bid and ask
+
+      orders.push(
+        getLimitOrderParams({
+          marketType: MarketType.PERP,
+          marketIndex: marketInfo.marketIndex,
+          direction: PositionDirection.LONG,
+          baseAssetAmount: numberToSafeBN(baseAmountPerSide, BASE_PRECISION),
+          price: numberToSafeBN(bidPrice, PRICE_PRECISION),
+          postOnly: PostOnlyParams.SLIDE,
+        })
+      )
+    }
+
+    for (const [amount, askSpreadBp] of askSpreadBps) {
+      totalAmount += amount;
+
+      const askPrice = oraclePrice * (1 + askSpreadBp / 10000);
+      const baseAmountPerSide = (amount / oraclePrice) / 2; // Split amount evenly between bid and ask
+
+      console.log("baseAmountPerSide", baseAmountPerSide);
+
+
+      orders.push(
+        getLimitOrderParams({
+          marketType: MarketType.PERP,
+          marketIndex: marketInfo.marketIndex,
+          direction: PositionDirection.SHORT,
+          baseAssetAmount: numberToSafeBN(baseAmountPerSide, BASE_PRECISION),
+          price: numberToSafeBN(askPrice, PRICE_PRECISION),
+          postOnly: PostOnlyParams.SLIDE,
+        })
+      )
+      }
+
+    if (totalAmount > vaultValue) {
+      throw new Error(`Amount is greater than vault value : ${totalAmount} > ${vaultValue}`);
+    }
+
+    if (!driftLookupTableAccount) {
+      throw new Error("Failed to fetch Drift market lookup table");
+    }
+
+    // Order construction
+    const instructions = [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
+      await driftClient.getPlaceOrdersIx(orders),
+    ];
+    
+
+    // Transaction execution
+    const latestBlockhash = await driftClient.connection.getLatestBlockhash();
+
+    const tx = await driftClient.txSender.sendVersionedTransaction(
+      await driftClient.txSender.getVersionedTransaction(
+        instructions,
+        [driftLookupTableAccount],
+        [],
+        driftClient.opts,
+        latestBlockhash,
+      )
+    );
+
+    await cleanUp();
+    return tx.txSig;
+
+  } catch (e) {
+    throw new Error(`Failed to add balanced liquidity: ${(e as Error).message}`);
   }
 }
