@@ -1,6 +1,7 @@
 import {
   BASE_PRECISION,
   convertToNumber,
+  DriftClient,
   getLimitOrderParams,
   getMarketOrderParams,
   getOrderParams,
@@ -15,6 +16,8 @@ import {
   PRICE_PRECISION,
   QUOTE_PRECISION,
   SwapReduceOnly,
+  QUOTE_PRECISION_EXP,
+  AMM_RESERVE_PRECISION_EXP,
   TEN,
 } from "@drift-labs/sdk";
 import {
@@ -42,6 +45,7 @@ import {
   ApiV3PoolInfoStandardItem,
 } from "@raydium-io/raydium-sdk-v2";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { BigNum } from "@drift-labs/sdk";
 
 let lastBid: number | undefined;
 let lastAsk: number | undefined;
@@ -948,15 +952,33 @@ export async function swapJupiterToDriftVault(
   }
 }
 
+// LP Utils
+function getLpSharesAmountForQuote(
+  driftClient: InstanceType<typeof DriftClient>,
+  marketIndex: number,
+  quoteAmount: InstanceType<typeof BN>
+): InstanceType<typeof BN> {
+  const tenMillionBigNum = BigNum.fromPrint('10000000', QUOTE_PRECISION_EXP);
+  const pricePerLpShare = driftClient.getQuoteValuePerLpShare(marketIndex);
+  
+  const result = BigNum.from(quoteAmount.toString(), QUOTE_PRECISION_EXP)
+    .scale(
+      tenMillionBigNum.toNum(),
+      BigNum.from(pricePerLpShare.toString(), QUOTE_PRECISION_EXP).mul(tenMillionBigNum).toNum()
+    )
+    .shiftTo(AMM_RESERVE_PRECISION_EXP);
+
+  return new BN(result.val.toString());
+}
+
 export async function addLiquidityBalToDriftVault(
   agent: SolanaAgentKit,
   vault: string,
-  marketSymbol: string,
-  bidSpreadBps: [number, number][],
-  askSpreadBps: [number, number][],
+  symbol: string,
+  amount: number,
 ): Promise<string> {
   try {
-    const { driftClient, vaultClient, cleanUp }= await initClients(agent, {
+    const { driftClient, cleanUp } = await initClients(agent, {
       authority: new PublicKey(vault),
       activeSubAccountId: 0,
       subAccountIds: [0],
@@ -965,98 +987,49 @@ export async function addLiquidityBalToDriftVault(
     const [isOwned, driftLookupTableAccount] = await Promise.all([
       getIsOwned(agent, vault),
       driftClient.connection.getAddressLookupTable(
-        // new PublicKey("FaMS3U4uBojvGn5FSDEPimddcXsCfwkKsFgMVVnDdxGb")
-        driftClient.marketLookupTable
+        new PublicKey("FaMS3U4uBojvGn5FSDEPimddcXsCfwkKsFgMVVnDdxGb")
+        // driftClient.marketLookupTable
       ).then(res => res.value)
     ]);
 
     if (!isOwned) {
-      throw new Error("Vault must be owned to add balanced liquidity");
-    }
-
-    // Market validation
-    const marketInfo = getMarketIndexAndType(`${marketSymbol}-PERP`);
-    const perpMarket = driftClient.getPerpMarketAccount(marketInfo.marketIndex);
-    
-    if (!perpMarket) {
-      throw new Error(
-        `Perp market not found for ${marketSymbol}-PERP. ` +
-        `Valid markets: ${MainnetPerpMarkets.map(m => m.symbol).join(', ')}`
-      );
-    }
-
-    // Oracle validation
-    const oracleData = driftClient.getOracleDataForPerpMarket(marketInfo.marketIndex);
-    if (!oracleData?.price) {
-      throw new Error(`Oracle price not available for ${marketSymbol}-PERP`);
-    }
-
-    // Price calculations
-    const oraclePrice = convertToNumber(oracleData.price, PRICE_PRECISION);
-
-
-    // Size calculations
-    const vaultValue = await getVaultAvailableBalance(agent, vault);
-
-    const orders = [];
-    let totalAmount = 0;
-    for (const [amount, bidSpreadBp] of bidSpreadBps) {
-      totalAmount += amount;
-
-      const bidPrice = oraclePrice * (1 - bidSpreadBp / 10000);
-      const baseAmountPerSide = (amount / oraclePrice) / 2; // Split amount evenly between bid and ask
-
-      orders.push(
-        getLimitOrderParams({
-          marketType: MarketType.PERP,
-          marketIndex: marketInfo.marketIndex,
-          direction: PositionDirection.LONG,
-          baseAssetAmount: numberToSafeBN(baseAmountPerSide, BASE_PRECISION),
-          price: numberToSafeBN(bidPrice, PRICE_PRECISION),
-          postOnly: PostOnlyParams.SLIDE,
-        })
-      )
-    }
-
-    for (const [amount, askSpreadBp] of askSpreadBps) {
-      totalAmount += amount;
-
-      const askPrice = oraclePrice * (1 + askSpreadBp / 10000);
-      const baseAmountPerSide = (amount / oraclePrice) / 2; // Split amount evenly between bid and ask
-
-      console.log("baseAmountPerSide", baseAmountPerSide);
-
-
-      orders.push(
-        getLimitOrderParams({
-          marketType: MarketType.PERP,
-          marketIndex: marketInfo.marketIndex,
-          direction: PositionDirection.SHORT,
-          baseAssetAmount: numberToSafeBN(baseAmountPerSide, BASE_PRECISION),
-          price: numberToSafeBN(askPrice, PRICE_PRECISION),
-          postOnly: PostOnlyParams.SLIDE,
-        })
-      )
-      }
-
-    if (totalAmount > vaultValue) {
-      throw new Error(`Amount is greater than vault value : ${totalAmount} > ${vaultValue}`);
+      throw new Error("Vault must be owned to add liquidity");
     }
 
     if (!driftLookupTableAccount) {
       throw new Error("Failed to fetch Drift market lookup table");
     }
 
-    // Order construction
-    const instructions = [
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
-      await driftClient.getPlaceOrdersIx(orders),
-    ];
+    // Market validation
+    const marketInfo = getMarketIndexAndType(`${symbol}-PERP`);
+    const perpMarket = driftClient.getPerpMarketAccount(marketInfo.marketIndex);
     
+    if (!perpMarket) {
+      throw new Error(
+        `Perp market not found for ${symbol}-PERP. ` +
+        `Valid markets: ${MainnetPerpMarkets.map(m => m.symbol).join(', ')}`
+      );
+    }
 
-    // Transaction execution
+    const instructions = [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 98160 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 306761 }),
+    ];
+
+    const quoteAmount = new BN(amount * QUOTE_PRECISION.toNumber());
+    const lpSharesAmount = getLpSharesAmountForQuote(
+      driftClient,
+      marketInfo.marketIndex,
+      quoteAmount
+    );
+
+    const addLpSharesIx = await driftClient.getAddPerpLpSharesIx(
+      lpSharesAmount,
+      marketInfo.marketIndex
+    );
+    instructions.push(addLpSharesIx);
+
     const latestBlockhash = await driftClient.connection.getLatestBlockhash();
-
     const tx = await driftClient.txSender.sendVersionedTransaction(
       await driftClient.txSender.getVersionedTransaction(
         instructions,
@@ -1071,6 +1044,74 @@ export async function addLiquidityBalToDriftVault(
     return tx.txSig;
 
   } catch (e) {
-    throw new Error(`Failed to add balanced liquidity: ${(e as Error).message}`);
+    throw new Error(`Failed to add liquidity: ${(e as Error).message}`);
+  }
+}
+
+export async function removeLiquidityBalFromDriftVault(
+  agent: SolanaAgentKit,
+  vault: string,
+  symbol: string,
+): Promise<string> {
+  try {
+    const { driftClient, cleanUp } = await initClients(agent, {
+      authority: new PublicKey(vault),
+      activeSubAccountId: 0,
+      subAccountIds: [0],
+    });
+
+    const [isOwned, driftLookupTableAccount] = await Promise.all([
+      getIsOwned(agent, vault),
+      driftClient.connection.getAddressLookupTable(
+        new PublicKey("FaMS3U4uBojvGn5FSDEPimddcXsCfwkKsFgMVVnDdxGb")
+        // driftClient.marketLookupTable
+      ).then(res => res.value)
+    ]);
+
+    if (!isOwned) {
+      throw new Error("Vault must be owned to remove liquidity");
+    }
+
+    if (!driftLookupTableAccount) {
+      throw new Error("Failed to fetch Drift market lookup table");
+    }
+
+    // Market validation
+    const marketInfo = getMarketIndexAndType(`${symbol}-PERP`);
+    const perpMarket = driftClient.getPerpMarketAccount(marketInfo.marketIndex);
+    
+    if (!perpMarket) {
+      throw new Error(
+        `Perp market not found for ${symbol}-PERP. ` +
+        `Valid markets: ${MainnetPerpMarkets.map(m => m.symbol).join(', ')}`
+      );
+    }
+
+    const instructions = [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 98160 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 306761 }),
+    ];
+
+    const removeLpSharesIx = await driftClient.getRemovePerpLpSharesIx(
+      marketInfo.marketIndex
+    );
+    instructions.push(removeLpSharesIx);
+
+    const latestBlockhash = await driftClient.connection.getLatestBlockhash();
+    const tx = await driftClient.txSender.sendVersionedTransaction(
+      await driftClient.txSender.getVersionedTransaction(
+        instructions,
+        [driftLookupTableAccount],
+        [],
+        driftClient.opts,
+        latestBlockhash,
+      )
+    );
+
+    await cleanUp();
+    return tx.txSig;
+
+  } catch (e) {
+    throw new Error(`Failed to remove liquidity: ${(e as Error).message}`);
   }
 }
