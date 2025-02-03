@@ -121,6 +121,7 @@ import {
   getAllTopics,
   getInferenceByTopicId,
   addLiquidityBalToDriftVault,
+  removeLiquidityBalFromDriftVault,
 } from "../tools";
 import {
   Config,
@@ -910,6 +911,12 @@ export class SolanaAgentKit {
       symbol,       // PERP market symbol
       amount,
     )
+  }
+  async removeLiquidityFromDelegatedDriftVault(
+    vault: string,
+    symbol: string,
+  ) {
+    return await removeLiquidityBalFromDriftVault(this, vault, symbol);
   }
   async tradeUsingDriftPerpAccount(
     amount: number,
