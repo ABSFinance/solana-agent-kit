@@ -1,0 +1,1 @@
+{"version":3,"file":"resolve_domain.d.ts","sourceRoot":"","sources":["../../../src/tools/alldomains/resolve_domain.ts"],"names":[],"mappings":"AACA,OAAO,EAAE,cAAc,EAAE,MAAM,aAAa,CAAC;AAC7C,OAAO,EAAE,SAAS,EAAE,MAAM,iBAAiB,CAAC;AAE5C;;;;;GAKG;AACH,wBAAsB,iBAAiB,CACrC,KAAK,EAAE,cAAc,EACrB,MAAM,EAAE,MAAM,GACb,OAAO,CAAC,SAAS,GAAG,SAAS,CAAC,CAgBhC"}

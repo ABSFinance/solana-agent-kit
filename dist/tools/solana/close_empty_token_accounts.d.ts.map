@@ -1,0 +1,1 @@
+{"version":3,"file":"close_empty_token_accounts.d.ts","sourceRoot":"","sources":["../../../src/tools/solana/close_empty_token_accounts.ts"],"names":[],"mappings":"AAKA,OAAO,EAAE,cAAc,EAAE,MAAM,aAAa,CAAC;AAQ7C;;;;GAIG;AACH,wBAAsB,uBAAuB,CAC3C,KAAK,EAAE,cAAc,GACpB,OAAO,CAAC;IAAE,SAAS,EAAE,MAAM,CAAC;IAAC,IAAI,EAAE,MAAM,CAAA;CAAE,CAAC,CAoC9C"}

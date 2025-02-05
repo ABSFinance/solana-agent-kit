@@ -1,0 +1,1 @@
+{"version":3,"file":"requestFunds.d.ts","sourceRoot":"","sources":["../../../src/actions/solana/requestFunds.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,MAAM,EAAE,MAAM,oBAAoB,CAAC;AAK5C,QAAA,MAAM,kBAAkB,EAAE,MAiCzB,CAAC;AAEF,eAAe,kBAAkB,CAAC"}
