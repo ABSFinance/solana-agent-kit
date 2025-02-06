@@ -4,6 +4,7 @@
   "description": "connect any ai agents to solana protocols",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "type": "module",
   "scripts": {
     "build": "tsc",
     "docs": "typedoc src --out docs",
